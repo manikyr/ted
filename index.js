@@ -47,6 +47,9 @@ const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/grem_messe
 mongoose.connect(MONGO_URI)
   .then(() => console.log('✅ MongoDB Connected'))
   .catch(err => console.error('❌ MongoDB Connection Error:', err));
+  app.get('/', (req, res) => {
+  res.send('Grem Messenger Server is Running! 🚀');
+});
 
 // --- API ---
 
