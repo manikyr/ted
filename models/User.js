@@ -9,7 +9,8 @@ const UserSchema = new mongoose.Schema({
   birthDate: { type: String, default: '' },
   blockedUsers: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }], // ЧС
   isOnline: { type: Boolean, default: false },
-  lastSeen: { type: Date, default: Date.now }
+  lastSeen: { type: Date, default: Date.now },
+  pushToken: { type: String }, // <--- ДОБАВЬТЕ ЭТУ СТРОКУ
 });
 
 module.exports = mongoose.model('User', UserSchema);
