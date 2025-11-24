@@ -50,7 +50,7 @@ mongoose.connect(MONGO_URI)
   .catch(err => console.error('❌ MongoDB Connection Error:', err));
 
 app.get('/', (req, res) => {
-  res.send('Grem Messenger Server is Running! 🚀');
+  res.send('Запустился Бро! 🚀');
 });
 
 // --- API ROUTES ---
