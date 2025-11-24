@@ -13,8 +13,6 @@ const jwt = require('jsonwebtoken');
 // --- FIREBASE ADMIN (ДЛЯ ПУШЕЙ) ---
 const admin = require('firebase-admin');
 
-// ПОПЫТКА ПОДКЛЮЧИТЬ ФАЙЛ КЛЮЧА
-// Если вы еще не скачали файл, сервер не упадет, но пуши работать не будут
 try {
     const serviceAccount = require('./serviceAccountKey.json');
     admin.initializeApp({
@@ -170,18 +168,19 @@ io.on('connection', (socket) => {
   
   socket.on('join', async (userId) => {
     if(!userId) return;
-    onlineUsers.set(userId, socket.id);
+    const idStr = userId.toString();
+    onlineUsers.set(idStr, socket.id);
     await User.findByIdAndUpdate(userId, { isOnline: true });
     io.emit('user:status_change', { userId, isOnline: true, lastSeen: null });
+    console.log(`✅ User connected: ${idStr}`);
   });
 
-  // === СОХРАНЕНИЕ ТОКЕНА УВЕДОМЛЕНИЙ С ТЕЛЕФОНА ===
+  // СОХРАНЕНИЕ ТОКЕНА ДЛЯ ПУШЕЙ
   socket.on('user:push_token', async ({ userId, token }) => {
       if(!userId || !token) return;
       try {
-          // Сохраняем токен в базу. Нужно убедиться, что в модели User есть поле pushToken (String)
           await User.findByIdAndUpdate(userId, { pushToken: token });
-          console.log(`📲 Push Token saved for ${userId}`);
+          console.log(`📲 Token saved for ${userId}`);
       } catch(e) { console.error("Token save error", e); }
   });
 
@@ -205,8 +204,6 @@ io.on('connection', (socket) => {
   socket.on('chat:read', async ({ chatId, userId }) => {
      try {
          await Message.updateMany({ chatId: chatId, sender: { $ne: userId }, readBy: { $ne: userId } }, { $addToSet: { readBy: userId } });
-         io.to(chatId).emit('message:read', { chatId, userId }); // Broadcast to room logic needed or iterate
-         // Упрощенная логика для списка (можно оптимизировать через комнаты socket.join(chatId))
          const chat = await Chat.findById(chatId);
          if(chat) {
              chat.members.forEach(m => { 
@@ -221,7 +218,7 @@ io.on('connection', (socket) => {
   socket.on('recording', ({ chatId, userId, isRecording }) => socket.broadcast.emit('recording', { chatId, userId, isRecording }));
   socket.on('user:profile_update', (userData) => socket.broadcast.emit('user:updated', userData));
 
-  // === ОТПРАВКА СООБЩЕНИЯ + ПУШ ===
+  // === ОТПРАВКА СООБЩЕНИЯ + PUSH ===
   socket.on('message:send', async (data) => {
     try {
       const { senderId, receiverId, text, fileUrl, type, isGroup, chatId: existingChatId } = data;
@@ -244,51 +241,31 @@ io.on('connection', (socket) => {
       const newMessage = await Message.create({ chatId: chat._id, sender: senderId, text, fileUrl, type });
       await Chat.findByIdAndUpdate(chat._id, { lastMessage: newMessage._id });
       
-      // Отправка сокетов и ПУШЕЙ
       chat.members.forEach(async (memberId) => { 
           const mIdString = memberId.toString();
-          
-          // 1. Отправляем в сокет (если онлайн)
           const sId = onlineUsers.get(mIdString); 
+          
           if (sId) { 
               io.to(sId).emit('message:new', { ...newMessage._doc, chatId: chat._id, receiverId: receiverId }); 
               io.to(sId).emit('chat:update_list'); 
           }
 
-          // 2. Отправляем PUSH (если это не я сам)
+          // PUSH
           if (mIdString !== senderId) {
               try {
                   const recipient = await User.findById(mIdString);
                   if (recipient && recipient.pushToken) {
-                      const pushTitle = isGroup ? `Группа: ${chat.title}` : 'Новое сообщение';
-                      const pushBody = type === 'text' ? text : (type === 'image' ? '📷 Фото' : '🎤 Голосовое');
-                      
                       await admin.messaging().send({
                           token: recipient.pushToken,
                           notification: {
-                              title: pushTitle,
-                              body: pushBody,
+                              title: isGroup ? `Группа: ${chat.title}` : 'Новое сообщение',
+                              body: type === 'text' ? text : 'Вложение',
                           },
-                          data: {
-                              chatId: chat._id.toString(), // Чтобы открывать чат по клику (нужна логика на клиенте)
-                          },
-                          android: {
-                              priority: 'high',
-                              notification: {
-                                  sound: 'default',
-                                  channelId: 'default'
-                              }
-                          }
+                          data: { chatId: chat._id.toString() },
+                          android: { priority: 'high', notification: { sound: 'default' } }
                       });
-                      console.log(`🚀 Push sent to ${recipient.username}`);
                   }
-              } catch (pushErr) {
-                  console.error("Push Error:", pushErr.message);
-                  // Если токен устарел, можно его удалить:
-                  if (pushErr.code === 'messaging/registration-token-not-registered') {
-                      await User.findByIdAndUpdate(mIdString, { pushToken: null });
-                  }
-              }
+              } catch (e) { console.error("Push Error:", e.message); }
           }
       });
     } catch (e) { console.error(e); }
@@ -305,9 +282,23 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('call:start', d => { const s = onlineUsers.get(d.receiverId); if(s) io.to(s).emit('call:incoming', d); });
-  socket.on('call:answer', d => { const s = onlineUsers.get(d.callerId); if(s) io.to(s).emit('call:answered', d); });
-  socket.on('ice-candidate', d => { const s = onlineUsers.get(d.targetId); if(s) io.to(s).emit('ice-candidate', d); });
+  // === ИСПРАВЛЕННЫЕ ЗВОНКИ ===
+  socket.on('call:start', (data) => { 
+      const receiverSocketId = onlineUsers.get(data.userToCall); 
+      if (receiverSocketId) io.to(receiverSocketId).emit('call:incoming', data); 
+  });
+  socket.on('call:answer', (data) => { 
+      const callerSocketId = onlineUsers.get(data.to); 
+      if (callerSocketId) io.to(callerSocketId).emit('call:accepted', data.signal); 
+  });
+  socket.on('call:end', (data) => {
+      const targetSocketId = onlineUsers.get(data.to);
+      if (targetSocketId) io.to(targetSocketId).emit('call:ended');
+  });
+  socket.on('ice-candidate', (data) => { 
+      const targetSocketId = onlineUsers.get(data.targetId); 
+      if (targetSocketId) io.to(targetSocketId).emit('ice-candidate', data.candidate); 
+  });
 });
 
 server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
