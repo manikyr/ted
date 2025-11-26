@@ -1,5 +1,3 @@
-// --- START OF FILE index.js ---
-
 require('dotenv').config();
 const express = require('express');
 const http = require('http');
@@ -11,12 +9,10 @@ const path = require('path');
 const fs = require('fs');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-// --- ИМПОРТ PEER SERVER ---
-const { ExpressPeerServer } = require('peer');
+const { ExpressPeerServer } = require('peer'); // Импорт PeerJS
 
-// --- FIREBASE ADMIN (ДЛЯ ПУШЕЙ) ---
+// --- FIREBASE ADMIN ---
 const admin = require('firebase-admin');
-
 try {
     const serviceAccount = require('./serviceAccountKey.json');
     admin.initializeApp({
@@ -24,14 +20,14 @@ try {
     });
     console.log("✅ Firebase Admin Initialized");
 } catch (e) {
-    console.log("⚠️ ОШИБКА FIREBASE: Файл serviceAccountKey.json не найден. Пуши не будут работать.");
+    console.log("⚠️ Firebase Error: serviceAccountKey.json missing");
 }
 
-// Библиотеки для Cloudinary
+// Cloudinary
 const cloudinary = require('cloudinary').v2;
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
 
-// Импорт моделей
+// Models
 const User = require('./models/User');
 const Chat = require('./models/Chat');
 const Message = require('./models/Message');
@@ -41,25 +37,37 @@ const server = http.createServer(app);
 
 const PORT = process.env.PORT || 5000;
 
+// Настройка прокси для Render/Heroku
 app.set('trust proxy', 1);
 
+// Разрешаем CORS для всех запросов
 app.use(cors({ 
     origin: "*", 
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-    credentials: false
+    credentials: true 
 }));
 app.use(express.json());
 
-// --- НАСТРОЙКА PEER SERVER ---
+// --- SOCKET.IO (Инициализируем ДО PeerJS) ---
+const io = new Server(server, { 
+    cors: { 
+        origin: "*", 
+        methods: ["GET", "POST"], 
+        credentials: true 
+    },
+    transports: ['websocket', 'polling'] // Разрешаем оба транспорта
+});
+
+// --- PEER SERVER (Подключаем после Socket.io) ---
 const peerServer = ExpressPeerServer(server, {
   debug: true,
-  path: '/'
+  path: '/',
+  allow_discovery: true
 });
 
 app.use('/peerjs', peerServer);
 
-// --- НАСТРОЙКА CLOUDINARY ---
+// Cloudinary Config
 cloudinary.config({
   cloud_name: 'dr4cu91pz',
   api_key: '472476498657853',
@@ -77,22 +85,15 @@ const storage = new CloudinaryStorage({
 
 const upload = multer({ storage });
 
-const io = new Server(server, { 
-    cors: { origin: "*", methods: ["GET", "POST"], credentials: false } 
-});
-
+// DB Connection
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/grem_messenger';
-
 mongoose.connect(MONGO_URI)
-  .then(() => console.log('✅ MongoDB Connected Successfully'))
-  .catch(err => console.error('❌ MongoDB Connection Error:', err));
+  .then(() => console.log('✅ MongoDB Connected'))
+  .catch(err => console.error('❌ MongoDB Error:', err));
 
-app.get('/', (req, res) => res.send('Grem Server Running YEA'));
+app.get('/', (req, res) => res.send('Grem Server Running'));
 
-// ==========================================
-// API ROUTES
-// ==========================================
-
+// --- API ROUTES ---
 app.post('/api/upload', upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).send('No file');
   res.json({ url: req.file.path, type: req.file.mimetype });
@@ -101,18 +102,15 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
 app.post('/api/register', async (req, res) => {
   try {
     const { username, password } = req.body;
-    if (!username || !password) return res.status(400).json({ error: 'Заполните все поля' });
-
-    const existingUser = await User.findOne({ username });
-    if (existingUser) return res.status(400).json({ error: 'Этот логин уже занят' });
-    
+    if (!username || !password) return res.status(400).json({ error: 'Заполните поля' });
+    const existing = await User.findOne({ username });
+    if (existing) return res.status(400).json({ error: 'Логин занят' });
     const hashedPassword = await bcrypt.hash(password, 10);
     const defaultAvatar = `https://ui-avatars.com/api/?name=${username}&background=7c3aed&color=fff&size=128`;
-    
     const user = await User.create({ username, nickname: username, password: hashedPassword, avatar: defaultAvatar });
     const token = jwt.sign({ id: user._id }, 'secret_key'); 
     res.json({ user, token });
-  } catch (e) { res.status(500).json({ error: "Ошибка при создании пользователя" }); }
+  } catch (e) { res.status(500).json({ error: "Ошибка регистрации" }); }
 });
 
 app.post('/api/login', async (req, res) => {
@@ -120,10 +118,8 @@ app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
     const user = await User.findOne({ username });
     if (!user) return res.status(400).json({ error: 'Пользователь не найден' });
-    
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(400).json({ error: 'Неверный пароль' });
-    
     const token = jwt.sign({ id: user._id }, 'secret_key');
     res.json({ user, token });
   } catch (e) { res.status(500).json({ error: "Ошибка входа" }); }
@@ -154,9 +150,7 @@ app.get('/api/search', async (req, res) => {
   } catch (e) { res.json([]); }
 });
 
-// ==========================================
-// SOCKET.IO
-// ==========================================
+// --- SOCKET LOGIC ---
 let onlineUsers = new Map();
 
 io.on('connection', (socket) => {
@@ -167,7 +161,6 @@ io.on('connection', (socket) => {
     onlineUsers.set(idStr, socket.id);
     await User.findByIdAndUpdate(userId, { isOnline: true });
     io.emit('user:status_change', { userId, isOnline: true, lastSeen: null });
-    console.log(`✅ User connected: ${idStr}`);
   });
 
   socket.on('user:push_token', async ({ userId, token }) => {
@@ -188,7 +181,7 @@ io.on('connection', (socket) => {
   socket.on('chat:get_history', async ({ chatId }) => {
     try { 
         const messages = await Message.find({ chatId }).sort({ createdAt: 1 }); 
-        socket.emit('message:history', { chatId, history: messages }); // Исправлено событие
+        socket.emit('message:history', { chatId, history: messages }); 
     } catch(e){}
   });
 
@@ -199,19 +192,17 @@ io.on('connection', (socket) => {
          if(chat) {
              chat.members.forEach(m => { 
                  const sId = onlineUsers.get(m.toString()); 
-                 if(sId) io.to(sId).emit('messages:read', { chatId, userId }); // Исправлено событие
+                 if(sId) io.to(sId).emit('messages:read', { chatId, userId }); 
              });
          }
      } catch(e){}
   });
 
-  socket.on('user:update_profile', (userData) => socket.broadcast.emit('user:status_change', { userId: userData._id, ...userData })); // Исправлено
+  socket.on('user:update_profile', (userData) => socket.broadcast.emit('user:status_change', { userId: userData._id, ...userData }));
 
-  // === ОТПРАВКА СООБЩЕНИЯ + PUSH ===
   socket.on('message:send', async (data) => {
     try {
       const { senderId, receiverId, text, fileUrl, type, isGroup, chatId: existingChatId } = data;
-      
       let chat;
       if (existingChatId) { 
           chat = await Chat.findById(existingChatId); 
@@ -236,10 +227,8 @@ io.on('connection', (socket) => {
           
           if (sId) { 
               io.to(sId).emit('message:new', { ...newMessage._doc, chatId: chat._id, receiverId: receiverId }); 
-              // io.to(sId).emit('chats_list'); // Не нужно, клиент сам обновит список
           }
 
-          // PUSH
           if (mIdString !== senderId) {
               try {
                   const recipient = await User.findById(mIdString);
@@ -248,7 +237,7 @@ io.on('connection', (socket) => {
                           token: recipient.pushToken,
                           notification: {
                               title: isGroup ? `Группа: ${chat.title}` : 'Новое сообщение',
-                              body: type === 'text' ? text : 'Вложение',
+                              body: type === 'text' ? text : (type === 'audio' ? '🎤 Голосовое' : '📷 Фото'),
                           },
                           data: { chatId: chat._id.toString() },
                           android: { priority: 'high', notification: { sound: 'default' } }
