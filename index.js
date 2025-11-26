@@ -11,65 +11,27 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { ExpressPeerServer } = require('peer');
 
-// --- FIREBASE ADMIN ---
+// --- FIREBASE ADMIN (PUSH NOTIFICATIONS) ---
 const admin = require('firebase-admin');
+
 try {
+    // Скачайте этот файл из Firebase Console -> Project Settings -> Service Accounts
     const serviceAccount = require('./serviceAccountKey.json');
     admin.initializeApp({
         credential: admin.credential.cert(serviceAccount)
     });
     console.log("✅ Firebase Admin Initialized");
 } catch (e) {
-    console.log("⚠️ Firebase Warning: serviceAccountKey.json not found (Push disabled)");
+    console.log("⚠️ ПРЕДУПРЕЖДЕНИЕ: Файл serviceAccountKey.json не найден. Пуш-уведомления на телефон не будут работать.");
 }
 
-// Cloudinary
+// --- CLOUDINARY (ФАЙЛЫ) ---
 const cloudinary = require('cloudinary').v2;
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
 
-// Models
-const User = require('./models/User');
-const Chat = require('./models/Chat');
-const Message = require('./models/Message');
-
-const app = express();
-const server = http.createServer(app);
-
-const PORT = process.env.PORT || 5000;
-
-app.set('trust proxy', 1);
-
-app.use(cors({ 
-    origin: "*", 
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-    credentials: true 
-}));
-app.use(express.json());
-
-// --- SOCKET.IO SETUP (FIX FOR ERROR 400) ---
-const io = new Server(server, { 
-    cors: { 
-        origin: "*", 
-        methods: ["GET", "POST"], 
-        credentials: true 
-    },
-    // Важно: разрешаем websocket для клиентов, которые форсируют его
-    transports: ['websocket', 'polling'] 
-});
-
-// --- PEER SERVER SETUP (FIX FOR BLOCKED CALLS) ---
-const peerServer = ExpressPeerServer(server, {
-  debug: true,
-  path: '/',
-  allow_discovery: true
-});
-
-app.use('/peerjs', peerServer);
-
-// Cloudinary Config
+// Настройте свои ключи Cloudinary
 cloudinary.config({
-  cloud_name: 'dr4cu91pz', // Замените на свои, если нужно
+  cloud_name: 'dr4cu91pz', 
   api_key: '472476498657853',
   api_secret: 'NDq3J1IFglDPrl7uMohWRMJKh1c'
 });
@@ -85,6 +47,41 @@ const storage = new CloudinaryStorage({
 
 const upload = multer({ storage });
 
+// --- MODELS ---
+const User = require('./models/User');
+const Chat = require('./models/Chat');
+const Message = require('./models/Message');
+
+const app = express();
+const server = http.createServer(app);
+const PORT = process.env.PORT || 5000;
+
+app.set('trust proxy', 1);
+
+app.use(cors({ 
+    origin: "*", 
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: true 
+}));
+app.use(express.json());
+
+// --- SOCKET.IO ---
+const io = new Server(server, { 
+    cors: { origin: "*", methods: ["GET", "POST"], credentials: true },
+    transports: ['websocket', 'polling']
+});
+
+// --- PEER SERVER (ЗВОНКИ БЕЗ VPN) ---
+const peerServer = ExpressPeerServer(server, {
+  debug: true,
+  path: '/',
+  allow_discovery: true
+});
+
+app.use('/peerjs', peerServer);
+
+// --- DB ---
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/grem_messenger';
 mongoose.connect(MONGO_URI)
   .then(() => console.log('✅ MongoDB Connected'))
@@ -92,7 +89,7 @@ mongoose.connect(MONGO_URI)
 
 app.get('/', (req, res) => res.send('Grem Server Running'));
 
-// --- API ROUTES ---
+// --- REST API ---
 app.post('/api/upload', upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).send('No file');
   res.json({ url: req.file.path, type: req.file.mimetype });
@@ -133,7 +130,7 @@ app.put('/api/user/update', async (req, res) => {
         updates.username = username;
     }
     const user = await User.findByIdAndUpdate(userId, updates, { new: true }).select('-password');
-    io.emit('user:updated_data', user); // Real-time update
+    io.emit('user:updated_data', user);
     res.json(user);
   } catch (e) { res.status(500).json({ error: 'Ошибка обновления' }); }
 });
@@ -160,12 +157,15 @@ io.on('connection', (socket) => {
     onlineUsers.set(idStr, socket.id);
     await User.findByIdAndUpdate(userId, { isOnline: true });
     io.emit('user:status_change', { userId, isOnline: true, lastSeen: null });
-    console.log(`User connected: ${idStr}`);
   });
 
+  // Сохранение токена FCM от мобильного клиента
   socket.on('user:push_token', async ({ userId, token }) => {
       if(!userId || !token) return;
-      try { await User.findByIdAndUpdate(userId, { pushToken: token }); } catch(e) {}
+      try { 
+          await User.findByIdAndUpdate(userId, { pushToken: token }); 
+          console.log(`📲 Token saved for ${userId}`);
+      } catch(e) {}
   });
 
   socket.on('get_chats', async (userId) => {
@@ -198,27 +198,23 @@ io.on('connection', (socket) => {
      } catch(e){}
   });
 
-  socket.on('user:update_profile', (userData) => {
-      socket.broadcast.emit('user:updated_data', userData);
-  });
+  socket.on('user:update_profile', (userData) => socket.broadcast.emit('user:updated_data', userData));
 
-  // --- CALLS LOGIC ---
+  // --- CALLS ---
   socket.on('call:connected', ({ to }) => {
-      const callerSocketId = onlineUsers.get(to);
-      if (callerSocketId) io.to(callerSocketId).emit('call:connected_confirmed');
+      const sId = onlineUsers.get(to);
+      if (sId) io.to(sId).emit('call:connected_confirmed');
   });
-
   socket.on('call:end', ({ to, reason }) => {
-      const targetSocketId = onlineUsers.get(to);
-      if (targetSocketId) io.to(targetSocketId).emit('call:ended_remote', { reason });
+      const sId = onlineUsers.get(to);
+      if (sId) io.to(sId).emit('call:ended_remote', { reason });
   });
-
   socket.on('call:toggle_media', ({ to, type, status }) => {
-      const targetSocketId = onlineUsers.get(to);
-      if (targetSocketId) io.to(targetSocketId).emit('call:remote_media_change', { type, status });
+      const sId = onlineUsers.get(to);
+      if (sId) io.to(sId).emit('call:remote_media_change', { type, status });
   });
 
-  // --- MESSAGING ---
+  // --- MESSAGES & PUSH ---
   socket.on('message:send', async (data) => {
     try {
       const { senderId, receiverId, text, fileUrl, type, isGroup, chatId: existingChatId } = data;
@@ -241,14 +237,17 @@ io.on('connection', (socket) => {
       const newMessage = await Message.create({ chatId: chat._id, sender: senderId, text, fileUrl, type });
       await Chat.findByIdAndUpdate(chat._id, { lastMessage: newMessage._id });
       
+      // Отправка всем участникам
       chat.members.forEach(async (memberId) => { 
           const mIdString = memberId.toString();
           const sId = onlineUsers.get(mIdString); 
           
+          // Отправка в сокет (если онлайн)
           if (sId) { 
               io.to(sId).emit('message:new', { ...newMessage._doc, chatId: chat._id, receiverId: receiverId }); 
           }
 
+          // Отправка PUSH (если оффлайн или свернут) - ТОЛЬКО ПОЛУЧАТЕЛЮ
           if (mIdString !== senderId) {
               try {
                   const recipient = await User.findById(mIdString);
@@ -256,14 +255,20 @@ io.on('connection', (socket) => {
                       await admin.messaging().send({
                           token: recipient.pushToken,
                           notification: {
-                              title: isGroup ? `Группа: ${chat.title}` : 'Новое сообщение',
-                              body: type === 'text' ? text : (type === 'audio' ? '🎤 Голосовое' : '📷 Фото'),
+                              title: 'Новое сообщение',
+                              body: type === 'text' ? text : (type === 'audio' ? '🎤 Голосовое сообщение' : '📷 Фотография'),
                           },
-                          data: { chatId: chat._id.toString() },
-                          android: { priority: 'high', notification: { sound: 'default' } }
+                          data: { 
+                              chatId: chat._id.toString(),
+                              type: 'message'
+                          },
+                          android: { priority: 'high', notification: { sound: 'default', clickAction: 'FLUTTER_NOTIFICATION_CLICK' } }
                       });
+                      console.log(`🔔 Push sent to ${recipient.username}`);
                   }
-              } catch (e) {}
+              } catch (e) {
+                  // console.error("Push error:", e.message);
+              }
           }
       });
     } catch (e) { console.error(e); }
