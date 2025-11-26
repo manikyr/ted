@@ -1,3 +1,5 @@
+// --- START OF FILE index.js ---
+
 require('dotenv').config();
 const express = require('express');
 const http = require('http');
@@ -9,6 +11,8 @@ const path = require('path');
 const fs = require('fs');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+// --- ИМПОРТ PEER SERVER ---
+const { ExpressPeerServer } = require('peer');
 
 // --- FIREBASE ADMIN (ДЛЯ ПУШЕЙ) ---
 const admin = require('firebase-admin');
@@ -46,6 +50,14 @@ app.use(cors({
     credentials: false
 }));
 app.use(express.json());
+
+// --- НАСТРОЙКА PEER SERVER ---
+const peerServer = ExpressPeerServer(server, {
+  debug: true,
+  path: '/'
+});
+
+app.use('/peerjs', peerServer);
 
 // --- НАСТРОЙКА CLOUDINARY ---
 cloudinary.config({
@@ -142,23 +154,6 @@ app.get('/api/search', async (req, res) => {
   } catch (e) { res.json([]); }
 });
 
-app.post('/api/group/create', async (req, res) => {
-    try {
-        const { title, adminId, memberIds, avatar } = req.body;
-        const allMembers = [...new Set([adminId, ...memberIds])];
-        const chat = await Chat.create({
-            isGroup: true, title, admin: adminId, members: allMembers,
-            groupAvatar: avatar || `https://ui-avatars.com/api/?name=${title}&background=purple&color=fff`
-        });
-        allMembers.forEach(mid => { const sId = onlineUsers.get(mid.toString()); if(sId) io.to(sId).emit('chat:update_list'); });
-        res.json(chat);
-    } catch(e) { res.status(500).json({error: e.message}); }
-});
-
-app.post('/api/user/block', async (req, res) => {
-    try { await User.findByIdAndUpdate(req.body.userId, { $addToSet: { blockedUsers: req.body.blockId } }); res.json({ success: true }); } catch(e) { res.status(500).send(e.message); }
-});
-
 // ==========================================
 // SOCKET.IO
 // ==========================================
@@ -175,13 +170,9 @@ io.on('connection', (socket) => {
     console.log(`✅ User connected: ${idStr}`);
   });
 
-  // СОХРАНЕНИЕ ТОКЕНА ДЛЯ ПУШЕЙ
   socket.on('user:push_token', async ({ userId, token }) => {
       if(!userId || !token) return;
-      try {
-          await User.findByIdAndUpdate(userId, { pushToken: token });
-          console.log(`📲 Token saved for ${userId}`);
-      } catch(e) { console.error("Token save error", e); }
+      try { await User.findByIdAndUpdate(userId, { pushToken: token }); } catch(e) {}
   });
 
   socket.on('get_chats', async (userId) => {
@@ -197,7 +188,7 @@ io.on('connection', (socket) => {
   socket.on('chat:get_history', async ({ chatId }) => {
     try { 
         const messages = await Message.find({ chatId }).sort({ createdAt: 1 }); 
-        socket.emit('chat:history', { chatId, messages }); 
+        socket.emit('message:history', { chatId, history: messages }); // Исправлено событие
     } catch(e){}
   });
 
@@ -208,15 +199,13 @@ io.on('connection', (socket) => {
          if(chat) {
              chat.members.forEach(m => { 
                  const sId = onlineUsers.get(m.toString()); 
-                 if(sId) io.to(sId).emit('message:read', { chatId, userId }); 
+                 if(sId) io.to(sId).emit('messages:read', { chatId, userId }); // Исправлено событие
              });
          }
      } catch(e){}
   });
 
-  socket.on('typing', ({ chatId, userId, isTyping }) => socket.broadcast.emit('typing', { chatId, userId, isTyping }));
-  socket.on('recording', ({ chatId, userId, isRecording }) => socket.broadcast.emit('recording', { chatId, userId, isRecording }));
-  socket.on('user:profile_update', (userData) => socket.broadcast.emit('user:updated', userData));
+  socket.on('user:update_profile', (userData) => socket.broadcast.emit('user:status_change', { userId: userData._id, ...userData })); // Исправлено
 
   // === ОТПРАВКА СООБЩЕНИЯ + PUSH ===
   socket.on('message:send', async (data) => {
@@ -247,7 +236,7 @@ io.on('connection', (socket) => {
           
           if (sId) { 
               io.to(sId).emit('message:new', { ...newMessage._doc, chatId: chat._id, receiverId: receiverId }); 
-              io.to(sId).emit('chat:update_list'); 
+              // io.to(sId).emit('chats_list'); // Не нужно, клиент сам обновит список
           }
 
           // PUSH
@@ -265,7 +254,7 @@ io.on('connection', (socket) => {
                           android: { priority: 'high', notification: { sound: 'default' } }
                       });
                   }
-              } catch (e) { console.error("Push Error:", e.message); }
+              } catch (e) {}
           }
       });
     } catch (e) { console.error(e); }
@@ -280,24 +269,6 @@ io.on('connection', (socket) => {
         await User.findByIdAndUpdate(uid, { isOnline: false, lastSeen: now }); 
         io.emit('user:status_change', { userId: uid, isOnline: false, lastSeen: now }); 
     }
-  });
-
-  // === ИСПРАВЛЕННЫЕ ЗВОНКИ ===
-  socket.on('call:start', (data) => { 
-      const receiverSocketId = onlineUsers.get(data.userToCall); 
-      if (receiverSocketId) io.to(receiverSocketId).emit('call:incoming', data); 
-  });
-  socket.on('call:answer', (data) => { 
-      const callerSocketId = onlineUsers.get(data.to); 
-      if (callerSocketId) io.to(callerSocketId).emit('call:accepted', data.signal); 
-  });
-  socket.on('call:end', (data) => {
-      const targetSocketId = onlineUsers.get(data.to);
-      if (targetSocketId) io.to(targetSocketId).emit('call:ended');
-  });
-  socket.on('ice-candidate', (data) => { 
-      const targetSocketId = onlineUsers.get(data.targetId); 
-      if (targetSocketId) io.to(targetSocketId).emit('ice-candidate', data.candidate); 
   });
 });
 
